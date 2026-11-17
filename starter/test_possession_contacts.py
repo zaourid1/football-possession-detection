@@ -4,7 +4,13 @@ import unittest
 
 import numpy as np
 
-from possession_contacts import ContactConfig, derive_interactions, detect_contacts
+from possession_contacts import (
+    ContactConfig,
+    _classify_touch_events,
+    _group_touch_candidates,
+    derive_interactions,
+    detect_contacts,
+)
 from possession_data import TrackingData
 from possession_features import extract_features
 
@@ -108,12 +114,67 @@ class ContactTests(unittest.TestCase):
         evidence = detect_contacts(data, extract_features(data), config=config)
         self.assertEqual(evidence.team[10], 0)
         self.assertEqual(evidence.episode_id[10], evidence.episode_id[12])
+        self.assertIn("controlled", [touch.classification for touch in evidence.touches])
 
         # Remove the controlled follow-through. The single impulse remains a
         # possible touch, but it must not become a possession episode.
         data.player_xy[11:, 0] = np.nan
         evidence = detect_contacts(data, extract_features(data), config=config)
         self.assertEqual(evidence.team[10], -1)
+        self.assertNotIn("controlled", [touch.classification for touch in evidence.touches])
+
+    def test_repeated_impulses_without_followthrough_never_confirm_control(self):
+        data = self.scene(n=30, fps=10)
+        data.ball_xy[:, 0] = 20 + (np.arange(30) % 2)
+        data.player_xy[:, 0] = [20.5, 30.0]
+        config = ContactConfig(velocity_window_s=0.1, confirm_s=0.3)
+        evidence = detect_contacts(data, extract_features(data), config=config)
+        self.assertTrue((evidence.team == -1).all())
+        self.assertNotIn("controlled", [touch.classification for touch in evidence.touches])
+
+    def test_opponent_redirection_recovered_by_prior_team_is_deflection_like(self):
+        data = self.scene(n=30, fps=10)
+        data.ball_xy[:, 0] = np.arange(30, dtype=float)
+        data.ball_xy[11:, 0] = 10 - np.arange(1, 20) * 0.8
+        data.player_xy[:, 0] = [40.0, 30.0]
+        data.player_xy[:, 1] = [10.5, 30.0]
+        config = ContactConfig(velocity_window_s=0.1)
+        interactions = derive_interactions(data, extract_features(data), config)
+        blocked = np.zeros(30, dtype=bool)
+        candidates = _group_touch_candidates(data, interactions, blocked, config)
+        self.assertTrue(candidates)
+
+        owner = np.full(30, -1, dtype=np.int8)
+        observed = np.zeros(30, dtype=bool)
+        owner[7], observed[7] = 0, True
+        owner[14], observed[14] = 0, True
+        touches = _classify_touch_events(
+            data, interactions, candidates, owner, observed, blocked, config)
+        away_touches = [touch for touch in touches if touch.team == 1]
+        self.assertIn("deflection_like", [touch.classification for touch in away_touches])
+
+        blocked[12] = True
+        interrupted = _classify_touch_events(
+            data, interactions, candidates, owner, observed, blocked, config)
+        self.assertNotIn("deflection_like", [touch.classification for touch in interrupted])
+
+        blocked[:] = False
+        owner[7] = 1
+        same_team = _classify_touch_events(
+            data, interactions, candidates, owner, observed, blocked, config)
+        self.assertNotIn("deflection_like", [touch.classification for touch in same_team])
+
+    def test_touch_without_reliable_followthrough_stays_unresolved(self):
+        data = self.scene(n=30, fps=10)
+        data.ball_xy[:, 0] = np.arange(30, dtype=float)
+        data.ball_xy[11, 0] = 10.2
+        data.ball_xy[12:, 0] = np.nan
+        data.player_xy[:, 0] = [10.5, 30.0]
+        evidence = detect_contacts(
+            data, extract_features(data), config=ContactConfig(velocity_window_s=0.1))
+        self.assertTrue(evidence.touches)
+        self.assertNotIn("controlled", [touch.classification for touch in evidence.touches])
+        self.assertNotIn("deflection_like", [touch.classification for touch in evidence.touches])
 
     def test_invalid_hysteresis_config_is_rejected(self):
         with self.assertRaises(ValueError):

@@ -33,6 +33,11 @@ def summarize(result, data):
         "raw_label_changes": int(np.count_nonzero(adjacent & (labels[1:] != labels[:-1]))),
         "controlled_episodes": int(len(np.unique(result.contacts.episode_id[
             result.contacts.episode_id >= 0]))),
+        "touch_events": {
+            classification: sum(
+                event.classification == classification for event in result.contacts.touches)
+            for classification in ("controlled", "deflection_like", "unresolved")
+        },
         "completed_pass_candidates": {name: sum(event.team == team for event in completed)
                                       for team, name in ((0, "H"), (1, "A"))},
         "uncertain_pass_candidates": sum(not event.completed for event in result.passes.events),

@@ -59,8 +59,17 @@ Player-ball relative motion must also be compatible with carrying or receiving
 the ball. To locate the start of a touch more accurately, the model compares
 valid ball velocities immediately before and after a nearby-player observation.
 A sufficiently large speed or direction change can seed a contact candidate,
-but it cannot establish possession without the normal multi-frame controlled
-follow-through. This prevents a lone deflection from becoming possession.
+but it cannot count toward the confirmation duration. The same local player
+must then provide the full normal multi-frame, low-relative-speed follow-through.
+Overlapping impulse windows are grouped into one event so tracking jitter cannot
+manufacture a confirmation run.
+
+Grouped touches are classified as controlled, deflection-like, or unresolved.
+Controlled requires a confirmed contact episode. Deflection-like requires an
+uncontrolled opponent redirection, rapid separation, and confirmed recovery by
+the previously controlling team without an intervening stoppage. This is an
+operational possession classification, not a claim about player intent; all
+other redirections remain unresolved.
 Velocity windows are invalidated by missing coordinates, implausible jumps, or
 half boundaries.
 
@@ -131,17 +140,18 @@ copy its pixel-normalized thresholds.
 
 ## Verification
 
-The repository contains 63 synthetic tests covering alignment, missing values,
+The repository contains 66 synthetic tests covering alignment, missing values,
 distance ties, half boundaries, stillness, control hysteresis, track-slot changes,
-ball-velocity impulses, isolated deflections, dribbles, completed and uncertain
-passes, possession memory, stoppage resets, gap bridging, layering, and
-deterministic output. These tests specify intended behaviour without using
-labels from the match.
+ball-velocity impulses, repeated impulses, isolated deflections, interrupted
+deflections, unresolved touches, dribbles, completed and uncertain passes,
+possession memory, stoppage resets, gap bridging, layering, and deterministic
+output. These tests specify intended behaviour without using labels from the
+match.
 
 The exact final CSV passes the supplied validator with 199,319 rows, ordered
 frames 0–199,318, and only `H`, `A`, `D`, or `X`. Its SHA-256 digest is:
 
-`f37632f72b38243cf72d31924ae33beeed7b93ad00c73fcfc2b4ed1cd048a1ef`
+`0ed4dbf6b17280e3ce86fbe7a7145bc209ac7b06a9459702cc132027596a8902`
 
 Aggregate diagnostics are used only as sanity checks. They do not establish
 frame accuracy or possession-spell accuracy.

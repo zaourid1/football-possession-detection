@@ -5,6 +5,7 @@ heuristics are independent of team-possession memory and use no match labels.
 """
 
 from dataclasses import dataclass
+from typing import List
 
 import numpy as np
 
@@ -28,6 +29,11 @@ class ContactConfig:
     min_touch_velocity_change_mps: float = 3.0
     min_touch_speed_change_mps: float = 2.0
     min_touch_direction_change_deg: float = 25.0
+    touch_group_s: float = 0.16
+    touch_followthrough_s: float = 0.6
+    deflection_context_s: float = 2.0
+    deflection_relative_speed_mps: float = 6.0
+    deflection_separation_gain_m: float = 0.5
 
     def __post_init__(self):
         values = tuple(self.__dict__.values())
@@ -44,7 +50,11 @@ class ContactConfig:
                 or self.touch_radius_m > self.entry_radius_m
                 or self.min_touch_velocity_change_mps <= 0
                 or self.min_touch_speed_change_mps < 0
-                or not 0 <= self.min_touch_direction_change_deg <= 180):
+                or not 0 <= self.min_touch_direction_change_deg <= 180
+                or self.touch_group_s <= 0 or self.touch_followthrough_s <= 0
+                or self.deflection_context_s <= 0
+                or self.deflection_relative_speed_mps <= 0
+                or self.deflection_separation_gain_m <= 0):
             raise ValueError("Invalid contact settings or hysteresis ordering")
 
 
@@ -59,6 +69,27 @@ class InteractionFeatures:
     velocity_change: np.ndarray
     direction_change_deg: np.ndarray
     touch_candidate: np.ndarray
+    carrier_velocity_after: np.ndarray
+    post_touch_relative_speed: np.ndarray
+    separation_gain_m: np.ndarray
+
+
+@dataclass(frozen=True)
+class TouchEvent:
+    """One grouped ball-velocity impulse near a local player.
+
+    ``deflection_like`` is an operational possession label: it means an
+    opponent redirected the ball without establishing control and the prior
+    team recovered it. It does not claim to know the player's intent.
+    """
+
+    team: int
+    slot: int
+    start_frame: int
+    end_frame: int
+    frame: int
+    classification: str
+    confidence: float
 
 
 @dataclass
@@ -69,6 +100,16 @@ class ContactEvidence:
     observed: np.ndarray
     confidence: np.ndarray
     interactions: InteractionFeatures
+    touches: List[TouchEvent]
+
+
+@dataclass(frozen=True)
+class _TouchCandidateEvent:
+    team: int
+    slot: int
+    start_frame: int
+    end_frame: int
+    frame: int
 
 
 def _velocities(xy, half, fps, lag, max_speed):
@@ -112,8 +153,12 @@ def derive_interactions(data: TrackingData, features, config=None):
     ball_velocity_after[:-lag] = ball_velocity[lag:]
     player_velocity = _velocities(data.player_xy, data.half, data.fps, lag,
                                   config.max_player_speed_mps)
+    player_velocity_after = np.full_like(player_velocity, np.nan)
+    player_velocity_after[:-lag] = player_velocity[lag:]
     nearest_slot = np.full((n, 2), -1, dtype=np.int32)
     carrier_velocity = np.full((n, 2, 2), np.nan, dtype=np.float32)
+    carrier_velocity_after = np.full((n, 2, 2), np.nan, dtype=np.float32)
+    separation_gain = np.full((n, 2), np.nan, dtype=np.float32)
     for team in (0, 1):
         slots = np.flatnonzero(data.track_team == team)
         if len(slots) == 0:
@@ -127,7 +172,24 @@ def derive_interactions(data: TrackingData, features, config=None):
         nearest_slot[known, team] = selected[known]
         frames = np.flatnonzero(known)
         carrier_velocity[known, team] = player_velocity[frames, selected[known]]
+        carrier_velocity_after[known, team] = player_velocity_after[frames, selected[known]]
+        future = frames + lag
+        has_future = future < n
+        future_frames = future[has_future]
+        future_slots = selected[known][has_future]
+        future_player = data.player_xy[future_frames, future_slots]
+        future_ball = data.ball_xy[future_frames]
+        future_valid = (np.isfinite(future_player).all(axis=1)
+                        & np.isfinite(future_ball).all(axis=1)
+                        & (data.half[future_frames] == data.half[frames[has_future]])
+                        & (data.half[future_frames] != 0))
+        future_distance = np.linalg.norm(future_player - future_ball, axis=1)
+        current_distance = features.team_distance_m[frames[has_future], team]
+        gain = np.where(future_valid, future_distance - current_distance, np.nan)
+        separation_gain[frames[has_future], team] = gain
     relative = np.linalg.norm(carrier_velocity - ball_velocity[:, None], axis=2)
+    post_touch_relative = np.linalg.norm(
+        carrier_velocity_after - ball_velocity_after[:, None], axis=2)
     before_speed = np.linalg.norm(ball_velocity, axis=1)
     after_speed = np.linalg.norm(ball_velocity_after, axis=1)
     velocity_change = np.linalg.norm(ball_velocity_after - ball_velocity, axis=1)
@@ -160,7 +222,109 @@ def derive_interactions(data: TrackingData, features, config=None):
     return InteractionFeatures(nearest_slot, ball_velocity, carrier_velocity,
                                relative, np.isfinite(ball_velocity).all(axis=1),
                                ball_velocity_after, velocity_change,
-                               direction_change, touch_candidate)
+                               direction_change, touch_candidate,
+                               carrier_velocity_after, post_touch_relative,
+                               separation_gain)
+
+
+def _group_touch_candidates(data, interactions, blocked, config):
+    """Collapse overlapping velocity windows into one local touch event."""
+    group_gap = max(1, round(config.touch_group_s * data.fps))
+    events = []
+    for team in (0, 1):
+        frames = np.flatnonzero(interactions.touch_candidate[:, team] & ~blocked)
+        if not len(frames):
+            continue
+        group = [int(frames[0])]
+        for frame_value in frames[1:]:
+            frame = int(frame_value)
+            previous = group[-1]
+            same_slot = (interactions.nearest_slot[frame, team]
+                         == interactions.nearest_slot[previous, team])
+            same_half = data.half[frame] == data.half[previous] != 0
+            uninterrupted = not np.any(blocked[previous:frame + 1])
+            if (frame - previous <= group_gap and same_slot and same_half
+                    and uninterrupted):
+                group.append(frame)
+            else:
+                events.append(_touch_event_from_group(team, group, interactions))
+                group = [frame]
+        events.append(_touch_event_from_group(team, group, interactions))
+    return sorted(events, key=lambda event: (event.frame, event.team))
+
+
+def _touch_event_from_group(team, frames, interactions):
+    """Represent a grouped impulse by its largest reliable velocity change."""
+    changes = interactions.velocity_change[frames]
+    representative = int(frames[int(np.nanargmax(changes))])
+    return _TouchCandidateEvent(
+        team=team,
+        slot=int(interactions.nearest_slot[representative, team]),
+        start_frame=int(frames[0]),
+        end_frame=int(frames[-1]),
+        frame=representative,
+    )
+
+
+def _classify_touch_events(data, interactions, candidates, owner, observed,
+                           blocked, config):
+    """Classify grouped impulses from confirmed post-touch behaviour.
+
+    Control requires a real confirmed episode backdated to the impulse. A
+    deflection-like event requires an earlier opposing owner, rapid separation
+    from the touching player, and confirmed recovery by that earlier team.
+    Everything ambiguous remains unresolved.
+    """
+    follow = max(1, round(config.touch_followthrough_s * data.fps))
+    context = max(1, round(config.deflection_context_s * data.fps))
+    touches = []
+    for event in candidates:
+        frame, team = event.frame, event.team
+        classification, confidence = "unresolved", 0.0
+        if observed[frame] and owner[frame] == team:
+            classification, confidence = "controlled", 1.0
+        else:
+            left = max(0, event.start_frame - context)
+            prior_team = -1
+            for prior in range(event.start_frame - 1, left - 1, -1):
+                if (blocked[prior]
+                        or data.half[prior] != data.half[event.start_frame]):
+                    break
+                if observed[prior] and owner[prior] >= 0:
+                    prior_team = int(owner[prior])
+                    break
+            right = min(len(data.half), event.end_frame + follow + 1)
+            post = slice(event.end_frame + 1, right)
+            valid_window = (
+                right > event.end_frame + 1
+                and data.half[frame] != 0
+                and np.all(data.half[event.start_frame:right] == data.half[frame])
+                and not np.any(blocked[event.start_frame:right])
+            )
+            touching_control = np.any(observed[post] & (owner[post] == team))
+            prior_recovers = prior_team >= 0 and np.any(
+                observed[post] & (owner[post] == prior_team))
+            relative = interactions.post_touch_relative_speed[frame, team]
+            separation = interactions.separation_gain_m[frame, team]
+            clear_departure = (
+                np.isfinite(relative)
+                and relative >= config.deflection_relative_speed_mps
+                and np.isfinite(separation)
+                and separation >= config.deflection_separation_gain_m
+            )
+            if (valid_window and prior_team != team and prior_recovers
+                    and not touching_control and clear_departure):
+                classification, confidence = "deflection_like", 0.6
+        touches.append(TouchEvent(
+            team=team,
+            slot=event.slot,
+            start_frame=event.start_frame,
+            end_frame=event.end_frame,
+            frame=frame,
+            classification=classification,
+            confidence=confidence,
+        ))
+    return touches
 
 
 def detect_contacts(data, features, blocked=None, config=None):
@@ -168,9 +332,10 @@ def detect_contacts(data, features, blocked=None, config=None):
 
     Confirmed onset is backdated only over its observed confirmation run.
     `observed` distinguishes actual contact evidence from a brief held carrier.
-    A visible fast release ends contact immediately. Very brief one-touch
-    interactions below confirm_s remain uncertain: trajectory change alone
-    cannot safely distinguish an intentional touch from an opponent deflection.
+    A visible fast release ends contact immediately. One grouped impulse may
+    seed an onset, but only ordinary low-relative-speed follow-through can
+    confirm it. Unconfirmed redirections are classified conservatively after
+    the contact pass as deflection-like or unresolved.
     """
     config = config or ContactConfig()
     n = len(data.half)
@@ -179,6 +344,15 @@ def detect_contacts(data, features, blocked=None, config=None):
     blocked = np.zeros(n, dtype=bool) if blocked is None else np.asarray(blocked, dtype=bool)
     if blocked.shape != (n,):
         raise ValueError("blocked must have one value per frame")
+    touch_candidates = _group_touch_candidates(data, interactions, blocked, config)
+    touch_seed_team = np.full(n, -1, dtype=np.int8)
+    for event in touch_candidates:
+        # A positive team-distance advantage makes cross-team collisions
+        # unlikely. If malformed evidence still collides, neither team seeds.
+        if touch_seed_team[event.frame] == -1:
+            touch_seed_team[event.frame] = event.team
+        elif touch_seed_team[event.frame] != event.team:
+            touch_seed_team[event.frame] = -2
     owner = np.full(n, -1, dtype=np.int8)
     carrier = np.full(n, -1, dtype=np.int32)
     episodes = np.full(n, -1, dtype=np.int32)
@@ -192,6 +366,8 @@ def detect_contacts(data, features, blocked=None, config=None):
     last_position = np.full(2, np.nan)
     candidate = -1
     candidate_frames = []
+    candidate_seeded = False
+    candidate_control_frames = 0
     previous_half = 0
 
     def compatible(frame, team, entry):
@@ -209,11 +385,6 @@ def detect_contacts(data, features, blocked=None, config=None):
             if np.linalg.norm(local_velocity) <= config.max_player_speed_mps:
                 relative = np.linalg.norm(interactions.ball_velocity[frame] - local_velocity)
         movement_compatible = (np.isfinite(relative) and relative <= speed)
-        # An observed impulse can seed a new-contact run at the touch frame.
-        # It cannot confirm control by itself: later compatible frames are
-        # still required by the normal confirmation window.
-        if entry and interactions.touch_candidate[frame, team]:
-            movement_compatible = True
         return (slot >= 0 and np.isfinite(margin) and margin >= advantage
                 and features.team_distance_m[frame, team] <= radius
                 and movement_compatible)
@@ -232,6 +403,8 @@ def detect_contacts(data, features, blocked=None, config=None):
             active_team = active_slot = active_episode = -1
             last_observed = -1
             candidate, candidate_frames = -1, []
+            candidate_seeded = False
+            candidate_control_frames = 0
         previous_half = half
         if half == 0 or blocked[frame]:
             continue
@@ -245,10 +418,14 @@ def detect_contacts(data, features, blocked=None, config=None):
             active_slot = slot
             last_observed, last_position = frame, data.player_xy[frame, slot].copy()
             candidate, candidate_frames = -1, []
+            candidate_seeded = False
+            candidate_control_frames = 0
             continue
 
         entry_team = int(features.nearest_team[frame])
-        entry = entry_team >= 0 and compatible(frame, entry_team, True)
+        ordinary_entry = entry_team >= 0 and compatible(frame, entry_team, True)
+        touch_seed = entry_team >= 0 and touch_seed_team[frame] == entry_team
+        entry = ordinary_entry or touch_seed
         if entry:
             slot = int(interactions.nearest_slot[frame, entry_team])
             # Candidate confirmation must itself be one plausible local carrier.
@@ -258,11 +435,24 @@ def detect_contacts(data, features, blocked=None, config=None):
                 prev_slot = interactions.nearest_slot[prev, entry_team]
                 step = np.linalg.norm(data.player_xy[frame, slot] - data.player_xy[prev, prev_slot])
                 continuity = step <= config.max_player_speed_mps / data.fps + 0.75
-            if candidate == entry_team and continuity:
+            if candidate == entry_team and continuity and ordinary_entry:
                 candidate_frames.append(frame)
-            else:
+                candidate_control_frames += 1
+            elif touch_seed:
                 candidate, candidate_frames = entry_team, [frame]
-            if len(candidate_frames) >= confirm:
+                candidate_seeded = True
+                candidate_control_frames = 0
+            elif ordinary_entry:
+                candidate, candidate_frames = entry_team, [frame]
+                candidate_seeded = False
+                candidate_control_frames = 1
+            else:
+                candidate, candidate_frames = -1, []
+                candidate_seeded = False
+                candidate_control_frames = 0
+            confirmed = (candidate_control_frames >= confirm if candidate_seeded
+                         else len(candidate_frames) >= confirm)
+            if confirmed:
                 active_team, active_slot, active_episode = entry_team, slot, next_episode
                 next_episode += 1
                 for start in candidate_frames:
@@ -272,9 +462,13 @@ def detect_contacts(data, features, blocked=None, config=None):
                     observed[start], confidence[start] = True, 1.0
                 last_observed, last_position = frame, data.player_xy[frame, slot].copy()
                 candidate, candidate_frames = -1, []
+                candidate_seeded = False
+                candidate_control_frames = 0
                 continue
         else:
             candidate, candidate_frames = -1, []
+            candidate_seeded = False
+            candidate_control_frames = 0
 
         # Hold only uncertain observations, not a measured departure or opponent
         # control candidate. Team ownership is handled separately by the caller.
@@ -287,4 +481,7 @@ def detect_contacts(data, features, blocked=None, config=None):
         else:
             active_team = active_slot = active_episode = -1
 
-    return ContactEvidence(owner, carrier, episodes, observed, confidence, interactions)
+    touches = _classify_touch_events(
+        data, interactions, touch_candidates, owner, observed, blocked, config)
+    return ContactEvidence(owner, carrier, episodes, observed, confidence,
+                           interactions, touches)
