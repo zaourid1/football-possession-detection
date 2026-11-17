@@ -24,6 +24,12 @@ evaluation/results/*.csv
 # information about the answer. They ship so that a fresh clone has something real to score.
 !evaluation/results/baseline_*.csv
 evaluation/reports/
+
+# Local exploratory notes and one-off inspection scripts are not submission source.
+starter/FRIEND_SOLVER_REVIEW.md
+starter/inspect_tags.py
+starter/inspect_tracking.py
+local_analysis/
 evaluation/scoreboard.csv
 
 # -- gated data --------------------------------------------------------------------------------

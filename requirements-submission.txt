@@ -1,0 +1,4 @@
+# Exact environment used to generate and verify the submitted CSV.
+# Python 3.11 is recommended; the recorded run used Python 3.11.4.
+numpy==2.3.2
+pandas==2.3.3

@@ -159,6 +159,25 @@ The notebooks additionally want `kloppy` and `matplotlib` (`requirements-starter
 **Python 3.9+ is recommended for those**: on Windows, installing Jupyter under 3.8 hits a
 `pywinpty` build failure that has nothing to do with this repository.
 
+### Reproduce this repository's layered submission
+
+The deterministic submission pipeline uses the tactical ATD and automatic Smart Tagging. It
+combines the reference temporal model with controlled-contact, pass, stoppage, and conservative
+gap evidence. Install the exact recorded environment and run:
+
+```bash
+python3 -m pip install -r requirements-submission.txt
+python3 -m unittest discover -s starter -p 'test_possession_*.py'
+python3 starter/run_possession.py --model layered \
+  --out evaluation/results/layered_pipeline.csv \
+  --report evaluation/reports/layered_pipeline_summary.json
+python3 evaluation/validate_submission.py evaluation/results/layered_pipeline.csv
+```
+
+The match data, generated CSV, and reports remain excluded from the public repository. See
+`TECHNICAL_DOCUMENT.md` for the method, possession rules, training-data statement, limitations,
+and exact output digest.
+
 ---
 
 ## Timeline
