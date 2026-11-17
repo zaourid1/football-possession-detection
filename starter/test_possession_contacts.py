@@ -79,11 +79,49 @@ class ContactTests(unittest.TestCase):
         self.assertTrue(np.isnan(features.ball_velocity[35:39]).all())
         self.assertTrue(features.ball_motion_valid[30])
 
+    def test_ball_impulse_next_to_player_is_a_touch_candidate(self):
+        data = self.scene(n=30, fps=10)
+        data.ball_xy[:, 0] = np.arange(30, dtype=float)
+        data.ball_xy[11:, 0] = 10 + np.arange(1, 20) * 0.2
+        data.player_xy[:, 0] = [10.5, 30.0]
+        data.player_xy[11:, 0, 0] = data.ball_xy[11:, 0] + 0.5
+        interactions = derive_interactions(
+            data, extract_features(data), ContactConfig(velocity_window_s=0.1))
+        self.assertTrue(interactions.touch_candidate[10, 0])
+        self.assertGreater(interactions.velocity_change[10], 3.0)
+
+    def test_constant_ball_motion_is_not_a_touch_candidate(self):
+        data = self.scene(n=30, fps=10)
+        data.ball_xy[:, 0] = np.arange(30, dtype=float) * 0.2
+        data.player_xy[:, 0, 0] = data.ball_xy[:, 0] + 0.5
+        interactions = derive_interactions(
+            data, extract_features(data), ContactConfig(velocity_window_s=0.1))
+        self.assertFalse(interactions.touch_candidate.any())
+
+    def test_touch_impulse_seeds_but_does_not_alone_confirm_control(self):
+        data = self.scene(n=30, fps=10)
+        data.ball_xy[:, 0] = np.arange(30, dtype=float)
+        data.ball_xy[11:, 0] = 10 + np.arange(1, 20) * 0.2
+        data.player_xy[:, 0] = [10.5, 30.0]
+        data.player_xy[11:, 0, 0] = data.ball_xy[11:, 0] + 0.5
+        config = ContactConfig(velocity_window_s=0.1, confirm_s=0.3)
+        evidence = detect_contacts(data, extract_features(data), config=config)
+        self.assertEqual(evidence.team[10], 0)
+        self.assertEqual(evidence.episode_id[10], evidence.episode_id[12])
+
+        # Remove the controlled follow-through. The single impulse remains a
+        # possible touch, but it must not become a possession episode.
+        data.player_xy[11:, 0] = np.nan
+        evidence = detect_contacts(data, extract_features(data), config=config)
+        self.assertEqual(evidence.team[10], -1)
+
     def test_invalid_hysteresis_config_is_rejected(self):
         with self.assertRaises(ValueError):
             ContactConfig(retain_radius_m=1)
         with self.assertRaises(ValueError):
             ContactConfig(confirm_s=0)
+        with self.assertRaises(ValueError):
+            ContactConfig(touch_radius_m=3)
 
 
 if __name__ == "__main__":

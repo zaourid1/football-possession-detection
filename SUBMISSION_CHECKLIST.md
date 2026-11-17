@@ -21,7 +21,7 @@ must not contain the gated match assets or a generated full-match label file.
 - [ ] Regenerate the final CSV from a clean environment using the command in
       `TECHNICAL_DOCUMENT.md`.
 - [ ] Confirm its SHA-256 is
-      `0ed4dbf6b17280e3ce86fbe7a7145bc209ac7b06a9459702cc132027596a8902`.
+      `f37632f72b38243cf72d31924ae33beeed7b93ad00c73fcfc2b4ed1cd048a1ef`.
 - [ ] Run `python3 evaluation/validate_submission.py <team_name>.csv` on the
       exact renamed upload file.
 - [ ] Confirm `git status --short` shows no match assets, generated report, or

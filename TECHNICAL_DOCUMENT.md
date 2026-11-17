@@ -56,8 +56,13 @@ neutral and never proves a stoppage.
 Control uses hysteresis: entering control requires a smaller player-ball radius
 and a clearer advantage over the opponent than retaining established control.
 Player-ball relative motion must also be compatible with carrying or receiving
-the ball. Velocity windows are invalidated by missing coordinates, implausible
-jumps, or half boundaries.
+the ball. To locate the start of a touch more accurately, the model compares
+valid ball velocities immediately before and after a nearby-player observation.
+A sufficiently large speed or direction change can seed a contact candidate,
+but it cannot establish possession without the normal multi-frame controlled
+follow-through. This prevents a lone deflection from becoming possession.
+Velocity windows are invalidated by missing coordinates, implausible jumps, or
+half boundaries.
 
 Track slots are short-lived hypotheses, not player identities. A locally
 plausible same-team slot handoff can retain one control episode. Carrier memory
@@ -126,16 +131,17 @@ copy its pixel-normalized thresholds.
 
 ## Verification
 
-The repository contains 60 synthetic tests covering alignment, missing values,
+The repository contains 63 synthetic tests covering alignment, missing values,
 distance ties, half boundaries, stillness, control hysteresis, track-slot changes,
-dribbles, completed and uncertain passes, possession memory, stoppage resets,
-gap bridging, layering, and deterministic output. These tests specify intended
-behaviour without using labels from the match.
+ball-velocity impulses, isolated deflections, dribbles, completed and uncertain
+passes, possession memory, stoppage resets, gap bridging, layering, and
+deterministic output. These tests specify intended behaviour without using
+labels from the match.
 
 The exact final CSV passes the supplied validator with 199,319 rows, ordered
 frames 0–199,318, and only `H`, `A`, `D`, or `X`. Its SHA-256 digest is:
 
-`0ed4dbf6b17280e3ce86fbe7a7145bc209ac7b06a9459702cc132027596a8902`
+`f37632f72b38243cf72d31924ae33beeed7b93ad00c73fcfc2b4ed1cd048a1ef`
 
 Aggregate diagnostics are used only as sanity checks. They do not establish
 frame accuracy or possession-spell accuracy.

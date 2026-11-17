@@ -24,6 +24,10 @@ class ContactConfig:
     max_player_speed_mps: float = 12.0
     entry_relative_speed_mps: float = 6.0
     retain_relative_speed_mps: float = 8.0
+    touch_radius_m: float = 1.5
+    min_touch_velocity_change_mps: float = 3.0
+    min_touch_speed_change_mps: float = 2.0
+    min_touch_direction_change_deg: float = 25.0
 
     def __post_init__(self):
         values = tuple(self.__dict__.values())
@@ -35,7 +39,12 @@ class ContactConfig:
                 or self.carrier_hold_s < 0 or self.velocity_window_s <= 0
                 or self.max_ball_speed_mps <= 0 or self.max_player_speed_mps <= 0
                 or self.entry_relative_speed_mps <= 0
-                or self.retain_relative_speed_mps < self.entry_relative_speed_mps):
+                or self.retain_relative_speed_mps < self.entry_relative_speed_mps
+                or self.touch_radius_m <= 0
+                or self.touch_radius_m > self.entry_radius_m
+                or self.min_touch_velocity_change_mps <= 0
+                or self.min_touch_speed_change_mps < 0
+                or not 0 <= self.min_touch_direction_change_deg <= 180):
             raise ValueError("Invalid contact settings or hysteresis ordering")
 
 
@@ -46,6 +55,10 @@ class InteractionFeatures:
     carrier_velocity: np.ndarray
     relative_speed: np.ndarray
     ball_motion_valid: np.ndarray
+    ball_velocity_after: np.ndarray
+    velocity_change: np.ndarray
+    direction_change_deg: np.ndarray
+    touch_candidate: np.ndarray
 
 
 @dataclass
@@ -92,6 +105,11 @@ def derive_interactions(data: TrackingData, features, config=None):
     lag = max(1, round(config.velocity_window_s * data.fps))
     ball_velocity = _velocities(data.ball_xy, data.half, data.fps, lag,
                                 config.max_ball_speed_mps)
+    # The backward velocity at t + lag describes the same observed interval as
+    # the forward velocity at t. Reusing it keeps both sides of a possible
+    # touch subject to exactly the same gap, jump, and half-boundary checks.
+    ball_velocity_after = np.full_like(ball_velocity, np.nan)
+    ball_velocity_after[:-lag] = ball_velocity[lag:]
     player_velocity = _velocities(data.player_xy, data.half, data.fps, lag,
                                   config.max_player_speed_mps)
     nearest_slot = np.full((n, 2), -1, dtype=np.int32)
@@ -110,8 +128,39 @@ def derive_interactions(data: TrackingData, features, config=None):
         frames = np.flatnonzero(known)
         carrier_velocity[known, team] = player_velocity[frames, selected[known]]
     relative = np.linalg.norm(carrier_velocity - ball_velocity[:, None], axis=2)
+    before_speed = np.linalg.norm(ball_velocity, axis=1)
+    after_speed = np.linalg.norm(ball_velocity_after, axis=1)
+    velocity_change = np.linalg.norm(ball_velocity_after - ball_velocity, axis=1)
+    speed_change = np.abs(after_speed - before_speed)
+    direction_change = np.full(n, np.nan, dtype=np.float32)
+    directional = (np.isfinite(before_speed) & np.isfinite(after_speed)
+                   & (before_speed > 0.25) & (after_speed > 0.25))
+    dot = np.sum(ball_velocity * ball_velocity_after, axis=1)
+    cosine = np.divide(dot, before_speed * after_speed,
+                       out=np.zeros(n, dtype=np.float32), where=directional)
+    direction_change[directional] = np.degrees(
+        np.arccos(np.clip(cosine[directional], -1.0, 1.0)))
+
+    impulse = (
+        np.isfinite(velocity_change)
+        & (velocity_change >= config.min_touch_velocity_change_mps)
+        & ((speed_change >= config.min_touch_speed_change_mps)
+           | (direction_change >= config.min_touch_direction_change_deg))
+    )
+    touch_candidate = np.zeros((n, 2), dtype=bool)
+    for team in (0, 1):
+        margin = features.distance_margin_m * (1 if team == 0 else -1)
+        touch_candidate[:, team] = (
+            impulse
+            & (nearest_slot[:, team] >= 0)
+            & np.isfinite(margin)
+            & (margin >= config.entry_advantage_m)
+            & (features.team_distance_m[:, team] <= config.touch_radius_m)
+        )
     return InteractionFeatures(nearest_slot, ball_velocity, carrier_velocity,
-                               relative, np.isfinite(ball_velocity).all(axis=1))
+                               relative, np.isfinite(ball_velocity).all(axis=1),
+                               ball_velocity_after, velocity_change,
+                               direction_change, touch_candidate)
 
 
 def detect_contacts(data, features, blocked=None, config=None):
@@ -159,9 +208,15 @@ def detect_contacts(data, features, blocked=None, config=None):
             local_velocity = (data.player_xy[frame, slot] - last_position) / elapsed
             if np.linalg.norm(local_velocity) <= config.max_player_speed_mps:
                 relative = np.linalg.norm(interactions.ball_velocity[frame] - local_velocity)
+        movement_compatible = (np.isfinite(relative) and relative <= speed)
+        # An observed impulse can seed a new-contact run at the touch frame.
+        # It cannot confirm control by itself: later compatible frames are
+        # still required by the normal confirmation window.
+        if entry and interactions.touch_candidate[frame, team]:
+            movement_compatible = True
         return (slot >= 0 and np.isfinite(margin) and margin >= advantage
                 and features.team_distance_m[frame, team] <= radius
-                and np.isfinite(relative) and relative <= speed)
+                and movement_compatible)
 
     def same_carrier(frame, team):
         slot = interactions.nearest_slot[frame, team]
